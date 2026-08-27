@@ -1,0 +1,9 @@
+[package]
+name = "fear-gba"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust desktop Game Boy Advance emulator inspired by gdkGBA"
+license = "MIT"
+
+[dependencies]
+minifb = "0.27"
