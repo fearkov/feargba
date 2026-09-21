@@ -33,8 +33,15 @@ arrows                d-pad
 X / Z                 A / B
 A / S                 L / R
 enter / backspace     start / select
+tab (hold)            fast forward
+P                     pause
+F1 / F2               save / load state
+F12                   screenshot next to the ROM
 escape                quit
 ```
+
+The save state goes to the same path as the backup file with a `.state`
+suffix. It carries no ROM, so it refuses to load into a different game.
 
 ## Headless mode
 
@@ -58,16 +65,19 @@ that overwrites the instructions behind itself runs the old ones like hardware
 does.
 
 Memory: the whole map with region mirroring, VRAM's odd upper block, byte
-writes duplicating into palette and background VRAM, wait states from WAITCNT,
-and BIOS reads from outside the BIOS returning the open bus latch.
+writes duplicating into palette and background VRAM, and BIOS reads from
+outside the BIOS returning the open bus latch. Access timing tracks whether
+an access follows on from the last one, since cartridge reads are much
+cheaper when they do, and the ROM prefetch unit is modelled well enough that
+straight line code runs at roughly the right speed.
 
 Video: scanline renderer for every mode. Four text layers, affine layers, the
 three bitmap modes, 128 sprites (regular and affine, 4bpp and 8bpp, both
 mapping layouts), both windows and the object window, mosaic, and the alpha,
 brighten and darken effects.
 
-DMA: four channels, immediate/vblank/hblank/sound-FIFO timing, address control
-including increment-and-reload, and repeat.
+DMA: four channels, immediate/vblank/hblank/sound-FIFO timing, DMA3's video
+capture mode, address control including increment-and-reload, and repeat.
 
 Timers: four channels with prescalers, cascade and interrupts.
 
@@ -77,7 +87,12 @@ stereo and played through cpal.
 Cartridge: save type detection, SRAM, 64K and 128K flash with bank switching
 and sector erase, EEPROM, and the GPIO real time clock.
 
-Not done: link cable, the prefetch buffer's timing effects, DMA3 video capture.
+Save states capture the whole machine, so loading one puts the game back
+exactly where it was.
+
+There is no link cable. Writes that would start a transfer complete straight
+away instead, so a game that looks for a partner reports none rather than
+hanging on the busy bit.
 
 ## Tests
 

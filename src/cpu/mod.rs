@@ -255,6 +255,10 @@ impl Cpu {
 
     /// Runs one instruction (or idles one cycle) and returns the cycles spent.
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
+        if bus.halt_requested {
+            bus.halt_requested = false;
+            self.halted = true;
+        }
         if let Some(flags) = self.intr_wait {
             if bus.bios_irq_flags() & flags != 0 {
                 let remaining = bus.bios_irq_flags() & !flags;
@@ -419,5 +423,74 @@ pub fn shift(kind: u32, value: u32, amount: u32, immediate: bool, carry: &mut bo
                 value.rotate_right(amount)
             }
         }
+    }
+}
+
+impl crate::state::Snapshot for Cpu {
+    fn save(&self, writer: &mut crate::state::Writer) {
+        for register in self.r {
+            writer.u32(register);
+        }
+        writer.bool(self.n);
+        writer.bool(self.z);
+        writer.bool(self.c);
+        writer.bool(self.v);
+        writer.bool(self.irq_disable);
+        writer.bool(self.fiq_disable);
+        writer.bool(self.thumb);
+        writer.u32(self.mode);
+        writer.u32(self.spsr);
+        for saved in self.spsr_bank {
+            writer.u32(saved);
+        }
+        for bank in self.bank {
+            writer.u32(bank[0]);
+            writer.u32(bank[1]);
+        }
+        for register in self.usr_r8_12 {
+            writer.u32(register);
+        }
+        for register in self.fiq_r8_12 {
+            writer.u32(register);
+        }
+        writer.bool(self.halted);
+        writer.option_u16(self.intr_wait);
+        writer.bool(self.flush);
+        writer.u32(self.pipeline[0]);
+        writer.u32(self.pipeline[1]);
+    }
+
+    fn load(&mut self, reader: &mut crate::state::Reader) -> Result<(), crate::state::StateError> {
+        for register in self.r.iter_mut() {
+            *register = reader.u32()?;
+        }
+        self.n = reader.bool()?;
+        self.z = reader.bool()?;
+        self.c = reader.bool()?;
+        self.v = reader.bool()?;
+        self.irq_disable = reader.bool()?;
+        self.fiq_disable = reader.bool()?;
+        self.thumb = reader.bool()?;
+        self.mode = reader.u32()?;
+        self.spsr = reader.u32()?;
+        for saved in self.spsr_bank.iter_mut() {
+            *saved = reader.u32()?;
+        }
+        for bank in self.bank.iter_mut() {
+            bank[0] = reader.u32()?;
+            bank[1] = reader.u32()?;
+        }
+        for register in self.usr_r8_12.iter_mut() {
+            *register = reader.u32()?;
+        }
+        for register in self.fiq_r8_12.iter_mut() {
+            *register = reader.u32()?;
+        }
+        self.halted = reader.bool()?;
+        self.intr_wait = reader.option_u16()?;
+        self.flush = reader.bool()?;
+        self.pipeline[0] = reader.u32()?;
+        self.pipeline[1] = reader.u32()?;
+        Ok(())
     }
 }

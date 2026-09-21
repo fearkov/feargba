@@ -8,6 +8,7 @@ pub mod cpu;
 pub mod dma;
 pub mod png;
 pub mod ppu;
+pub mod state;
 pub mod timer;
 
 pub use bus::Bus;
@@ -93,4 +94,34 @@ impl Gba {
     pub fn take_audio(&mut self) -> Vec<i16> {
         std::mem::take(&mut self.bus.apu.buffer)
     }
+
+    /// Captures the whole machine. The cartridge ROM is not included, so a
+    /// state only loads back into the game it came from.
+    pub fn save_state(&self) -> Vec<u8> {
+        use state::Snapshot;
+        let mut writer = state::Writer::default();
+        state::write_header(&mut writer, game_id(&self.bus.cart.rom));
+        self.cpu.save(&mut writer);
+        self.bus.save(&mut writer);
+        writer.data
+    }
+
+    pub fn load_state(&mut self, data: &[u8]) -> Result<(), state::StateError> {
+        use state::Snapshot;
+        let mut reader = state::Reader::new(data);
+        state::read_header(&mut reader, game_id(&self.bus.cart.rom))?;
+        self.cpu.load(&mut reader)?;
+        self.bus.load(&mut reader)?;
+        Ok(())
+    }
+}
+
+/// Hashes the cartridge header so a state cannot be loaded into another game.
+fn game_id(rom: &[u8]) -> u32 {
+    let mut id = rom.len() as u32;
+    for offset in 0xa0..0xb0 {
+        let byte = rom.get(offset).copied().unwrap_or(0);
+        id = id.wrapping_mul(31).wrapping_add(byte as u32);
+    }
+    id
 }

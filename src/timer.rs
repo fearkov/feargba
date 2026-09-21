@@ -110,3 +110,24 @@ impl Timers {
         soonest
     }
 }
+
+impl crate::state::Snapshot for Timers {
+    fn save(&self, writer: &mut crate::state::Writer) {
+        for timer in &self.channel {
+            writer.u16(timer.counter);
+            writer.u16(timer.reload);
+            writer.u16(timer.control);
+            writer.u32(timer.residue);
+        }
+    }
+
+    fn load(&mut self, reader: &mut crate::state::Reader) -> Result<(), crate::state::StateError> {
+        for timer in &mut self.channel {
+            timer.counter = reader.u16()?;
+            timer.reload = reader.u16()?;
+            timer.control = reader.u16()?;
+            timer.residue = reader.u32()?;
+        }
+        Ok(())
+    }
+}

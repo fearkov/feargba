@@ -306,3 +306,95 @@ fn a_frame_is_the_expected_length() {
     assert_eq!(gba.framebuffer().len(), WIDTH * HEIGHT);
     assert_eq!(gba.bus.ppu.vcount, 0, "a frame ends back at the first line");
 }
+
+#[test]
+fn a_write_to_haltcnt_stops_the_processor() {
+    let mut gba = Gba::new(vec![0; 0x200], None);
+    gba.bus.write8(0x0400_0301, 0x00);
+    gba.cpu.step(&mut gba.bus);
+    assert!(gba.cpu.halted);
+}
+
+#[test]
+fn green_swap_exchanges_green_between_neighbours() {
+    let mut bus = bus();
+    bus.write16(0x0400_0000, 0x0403); // mode 3, background 2 on
+    bus.write16(0x0600_0000, 0x001f); // red
+    bus.write16(0x0600_0002, 0x03e0); // green
+    bus.write16(0x0400_0002, 1);
+    bus.run_cycles(1232);
+    assert_eq!(bus.ppu.framebuffer[0], 0x00ff_ff00, "red took its neighbour's green");
+    assert_eq!(bus.ppu.framebuffer[1], 0x0000_0000, "and gave its own away");
+}
+
+#[test]
+fn video_capture_runs_from_line_two_until_line_162() {
+    let mut bus = bus();
+    for word in 0..200u32 {
+        bus.write32(0x0200_0000 + word * 4, 0xaa);
+    }
+    bus.write32(0x0400_00d4, 0x0200_0000);
+    bus.write32(0x0400_00d8, 0x0300_0000);
+    bus.write16(0x0400_00dc, 1);
+    // enable, repeat, 32 bit, special timing
+    bus.write16(0x0400_00de, 0x8000 | 0x0200 | 0x0400 | 0x3000);
+
+    bus.run_cycles(1232); // line 0
+    bus.run_cycles(1232); // line 1
+    assert_eq!(bus.read32(0x0300_0000), 0, "nothing before line two");
+    bus.run_cycles(1232); // line 2
+    assert_eq!(bus.read32(0x0300_0000), 0xaa);
+
+    for _ in 0..200 {
+        bus.run_cycles(1232);
+    }
+    assert_eq!(
+        bus.read16(0x0400_00de) & 0x8000,
+        0,
+        "the channel switches itself off at line 162"
+    );
+}
+
+#[test]
+fn a_serial_transfer_completes_instead_of_hanging() {
+    let mut bus = bus();
+    assert_eq!(bus.read16(0x0400_0120), 0xffff, "no partner is connected");
+    bus.write16(0x0400_0128, 0x4080); // start, with the interrupt enabled
+    assert_eq!(bus.read16(0x0400_0128) & 0x0080, 0, "the busy bit cleared");
+    assert_ne!(bus.interrupt_flags & 1 << 7, 0);
+}
+
+#[test]
+fn cartridge_reads_are_cheaper_when_they_follow_on() {
+    let mut bus = bus();
+    bus.access_cycles = 0;
+    bus.read16(0x0800_0000);
+    let first = bus.access_cycles;
+
+    bus.access_cycles = 0;
+    bus.read16(0x0800_0002);
+    let sequential = bus.access_cycles;
+
+    bus.access_cycles = 0;
+    bus.read16(0x0800_1000);
+    let jumped = bus.access_cycles;
+
+    assert!(sequential < first, "{sequential} should beat {first}");
+    assert_eq!(jumped, first, "a jump pays the full price again");
+}
+
+#[test]
+fn the_prefetch_unit_speeds_up_straight_line_code() {
+    let mut bus = bus();
+    bus.write16(0x0400_0204, 0x4000); // WAITCNT with prefetch enabled
+    bus.read16_code(0x0800_0000);
+    bus.access_cycles = 0;
+    bus.read16_code(0x0800_0002);
+    assert_eq!(bus.access_cycles, 1, "the buffer already holds it");
+
+    bus.write16(0x0400_0204, 0x0000); // prefetch off
+    bus.read16_code(0x0800_0000);
+    bus.access_cycles = 0;
+    bus.read16_code(0x0800_0002);
+    assert!(bus.access_cycles > 1);
+}

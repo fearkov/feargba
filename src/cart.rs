@@ -584,3 +584,145 @@ fn civil_from_unix(seconds: i64) -> (i64, u32, u32, u32, u32, u32, u32) {
     let year = if m <= 2 { y + 1 } else { y };
     (year, m, d, weekday, hour, minute, second)
 }
+
+use crate::state::{Reader, Snapshot, StateError, Writer};
+
+impl FlashState {
+    fn code(self) -> u8 {
+        match self {
+            FlashState::Ready => 0,
+            FlashState::Command1 => 1,
+            FlashState::Command2 => 2,
+            FlashState::WriteByte => 3,
+            FlashState::BankSelect => 4,
+        }
+    }
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => FlashState::Command1,
+            2 => FlashState::Command2,
+            3 => FlashState::WriteByte,
+            4 => FlashState::BankSelect,
+            _ => FlashState::Ready,
+        }
+    }
+}
+
+impl EepromState {
+    fn code(self) -> u8 {
+        match self {
+            EepromState::Ready => 0,
+            EepromState::Address => 1,
+            EepromState::ReadDummy => 2,
+            EepromState::Read => 3,
+            EepromState::Write => 4,
+        }
+    }
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => EepromState::Address,
+            2 => EepromState::ReadDummy,
+            3 => EepromState::Read,
+            4 => EepromState::Write,
+            _ => EepromState::Ready,
+        }
+    }
+}
+
+impl SaveKind {
+    fn code(self) -> u8 {
+        match self {
+            SaveKind::None => 0,
+            SaveKind::Sram => 1,
+            SaveKind::Flash64 => 2,
+            SaveKind::Flash128 => 3,
+            SaveKind::Eeprom512 => 4,
+            SaveKind::Eeprom8k => 5,
+        }
+    }
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => SaveKind::Sram,
+            2 => SaveKind::Flash64,
+            3 => SaveKind::Flash128,
+            4 => SaveKind::Eeprom512,
+            5 => SaveKind::Eeprom8k,
+            _ => SaveKind::None,
+        }
+    }
+}
+
+impl Snapshot for Rtc {
+    fn save(&self, writer: &mut Writer) {
+        writer.u16(self.data);
+        writer.u16(self.direction);
+        writer.bool(self.readable);
+        writer.u8(match self.state {
+            RtcState::Idle => 0,
+            RtcState::Command => 1,
+            RtcState::Transfer => 2,
+        });
+        writer.u8(self.command);
+        writer.u32(self.bits);
+        writer.u8(self.buffer);
+        writer.usize(self.byte_index);
+        writer.bytes(&self.transfer);
+        writer.bool(self.reading);
+        writer.u8(self.control);
+        writer.bool(self.last_sck);
+        writer.bool(self.last_cs);
+    }
+    fn load(&mut self, reader: &mut Reader) -> Result<(), StateError> {
+        self.data = reader.u16()?;
+        self.direction = reader.u16()?;
+        self.readable = reader.bool()?;
+        self.state = match reader.u8()? {
+            1 => RtcState::Command,
+            2 => RtcState::Transfer,
+            _ => RtcState::Idle,
+        };
+        self.command = reader.u8()?;
+        self.bits = reader.u32()?;
+        self.buffer = reader.u8()?;
+        self.byte_index = reader.usize()?;
+        reader.into_vec(&mut self.transfer)?;
+        self.reading = reader.bool()?;
+        self.control = reader.u8()?;
+        self.last_sck = reader.bool()?;
+        self.last_cs = reader.bool()?;
+        Ok(())
+    }
+}
+
+impl Snapshot for Cart {
+    fn save(&self, writer: &mut Writer) {
+        writer.u8(self.kind.code());
+        writer.bytes(&self.save);
+        writer.u8(self.flash_state.code());
+        writer.bool(self.flash_id_mode);
+        writer.bool(self.flash_erase_armed);
+        writer.usize(self.flash_bank);
+        writer.u8(self.eeprom_state.code());
+        writer.usize(self.eeprom_address);
+        writer.u64(self.eeprom_buffer);
+        writer.u32(self.eeprom_bits);
+        writer.bool(self.has_rtc);
+        self.rtc.save(writer);
+    }
+    fn load(&mut self, reader: &mut Reader) -> Result<(), StateError> {
+        self.kind = SaveKind::from_code(reader.u8()?);
+        reader.into_vec(&mut self.save)?;
+        self.flash_state = FlashState::from_code(reader.u8()?);
+        self.flash_id_mode = reader.bool()?;
+        self.flash_erase_armed = reader.bool()?;
+        self.flash_bank = reader.usize()? & 1;
+        self.eeprom_state = EepromState::from_code(reader.u8()?);
+        self.eeprom_address = reader.usize()?;
+        self.eeprom_buffer = reader.u64()?;
+        self.eeprom_bits = reader.u32()?;
+        self.has_rtc = reader.bool()?;
+        self.rtc.load(reader)?;
+        self.save_dirty = true;
+        Ok(())
+    }
+}

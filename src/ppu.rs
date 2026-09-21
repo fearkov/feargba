@@ -11,9 +11,12 @@ const TOTAL_LINES: u16 = 228;
 /// Marks a scanline slot no layer has written yet.
 const TRANSPARENT: u16 = 0x8000;
 
+/// Hblank on a visible line, which is when background DMA runs.
 pub const EVENT_HBLANK: u8 = 1;
 pub const EVENT_VBLANK: u8 = 2;
 pub const EVENT_FRAME: u8 = 4;
+/// Hblank on any line at all, including the ones below the screen.
+pub const EVENT_HBLANK_ANY: u8 = 8;
 
 #[derive(Clone, Copy, Default)]
 struct ObjPixel {
@@ -53,6 +56,9 @@ pub struct Ppu {
     pub bldy: u16,
 
     cycles: u32,
+    /// The line the most recent hblank belonged to; `vcount` has moved on by
+    /// the time the bus acts on the event.
+    pub hblank_line: u16,
     pub framebuffer: Vec<u32>,
 
     bg_line: [[u16; WIDTH]; 4],
@@ -96,6 +102,7 @@ impl Ppu {
             bldalpha: 0,
             bldy: 0,
             cycles: 0,
+            hblank_line: 0,
             framebuffer: vec![0; WIDTH * HEIGHT],
             bg_line: [[TRANSPARENT; WIDTH]; 4],
             obj_line: [ObjPixel::default(); WIDTH],
@@ -115,6 +122,8 @@ impl Ppu {
 
         if self.dispstat & 2 == 0 && self.cycles >= HBLANK_CYCLES && self.vcount < TOTAL_LINES {
             self.dispstat |= 2;
+            self.hblank_line = self.vcount;
+            events |= EVENT_HBLANK_ANY;
             if self.vcount < HEIGHT as u16 {
                 self.render_scanline();
                 events |= EVENT_HBLANK;
@@ -167,6 +176,8 @@ impl Ppu {
 
             if self.cycles >= HBLANK_CYCLES {
                 self.dispstat |= 2;
+                self.hblank_line = self.vcount;
+                events |= EVENT_HBLANK_ANY;
                 if self.vcount < HEIGHT as u16 {
                     self.render_scanline();
                     events |= EVENT_HBLANK;
@@ -285,6 +296,20 @@ impl Ppu {
             self.render_sprites(line);
         }
         self.compose(line);
+        if self.green_swap & 1 != 0 {
+            self.swap_green(line);
+        }
+    }
+
+    /// Exchanges the green channel between each pair of neighbouring pixels.
+    fn swap_green(&mut self, line: usize) {
+        let row = &mut self.framebuffer[line * WIDTH..(line + 1) * WIDTH];
+        for pair in row.as_chunks_mut::<2>().0 {
+            let left_green = pair[0] & 0x0000_ff00;
+            let right_green = pair[1] & 0x0000_ff00;
+            pair[0] = (pair[0] & !0x0000_ff00) | right_green;
+            pair[1] = (pair[1] & !0x0000_ff00) | left_green;
+        }
     }
 
     fn mosaic_x(&self, background: usize, x: usize) -> usize {
@@ -769,4 +794,88 @@ pub fn to_rgb(color: u16) -> u32 {
     let b = ((color >> 10) & 0x1f) as u32;
     let expand = |value: u32| (value << 3) | (value >> 2);
     (expand(r) << 16) | (expand(g) << 8) | expand(b)
+}
+
+impl crate::state::Snapshot for Ppu {
+    fn save(&self, writer: &mut crate::state::Writer) {
+        writer.bytes(&self.vram);
+        writer.bytes(&self.palette);
+        writer.bytes(&self.oam);
+        writer.u16(self.dispcnt);
+        writer.u16(self.green_swap);
+        writer.u16(self.dispstat);
+        writer.u16(self.vcount);
+        for index in 0..4 {
+            writer.u16(self.bgcnt[index]);
+            writer.u16(self.bghofs[index]);
+            writer.u16(self.bgvofs[index]);
+        }
+        for index in 0..2 {
+            writer.i16(self.bgpa[index]);
+            writer.i16(self.bgpb[index]);
+            writer.i16(self.bgpc[index]);
+            writer.i16(self.bgpd[index]);
+            writer.i32(self.bgx[index]);
+            writer.i32(self.bgy[index]);
+            writer.i32(self.bgx_internal[index]);
+            writer.i32(self.bgy_internal[index]);
+            writer.u16(self.winh[index]);
+            writer.u16(self.winv[index]);
+        }
+        writer.u16(self.winin);
+        writer.u16(self.winout);
+        writer.u16(self.mosaic);
+        writer.u16(self.bldcnt);
+        writer.u16(self.bldalpha);
+        writer.u16(self.bldy);
+        writer.u32(self.cycles);
+        writer.u16(self.hblank_line);
+        writer.usize(self.framebuffer.len());
+        for pixel in &self.framebuffer {
+            writer.u32(*pixel);
+        }
+    }
+
+    fn load(&mut self, reader: &mut crate::state::Reader) -> Result<(), crate::state::StateError> {
+        reader.into_bytes(&mut self.vram)?;
+        reader.into_bytes(&mut self.palette)?;
+        reader.into_bytes(&mut self.oam)?;
+        self.dispcnt = reader.u16()?;
+        self.green_swap = reader.u16()?;
+        self.dispstat = reader.u16()?;
+        self.vcount = reader.u16()?;
+        for index in 0..4 {
+            self.bgcnt[index] = reader.u16()?;
+            self.bghofs[index] = reader.u16()?;
+            self.bgvofs[index] = reader.u16()?;
+        }
+        for index in 0..2 {
+            self.bgpa[index] = reader.i16()?;
+            self.bgpb[index] = reader.i16()?;
+            self.bgpc[index] = reader.i16()?;
+            self.bgpd[index] = reader.i16()?;
+            self.bgx[index] = reader.i32()?;
+            self.bgy[index] = reader.i32()?;
+            self.bgx_internal[index] = reader.i32()?;
+            self.bgy_internal[index] = reader.i32()?;
+            self.winh[index] = reader.u16()?;
+            self.winv[index] = reader.u16()?;
+        }
+        self.winin = reader.u16()?;
+        self.winout = reader.u16()?;
+        self.mosaic = reader.u16()?;
+        self.bldcnt = reader.u16()?;
+        self.bldalpha = reader.u16()?;
+        self.bldy = reader.u16()?;
+        self.cycles = reader.u32()?;
+        self.hblank_line = reader.u16()?;
+        let pixels = reader.usize()?;
+        for index in 0..pixels {
+            let value = reader.u32()?;
+            if let Some(pixel) = self.framebuffer.get_mut(index) {
+                *pixel = value;
+            }
+        }
+        Ok(())
+    }
 }

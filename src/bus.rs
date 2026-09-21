@@ -3,7 +3,7 @@
 use crate::apu::Apu;
 use crate::cart::{Cart, SaveKind};
 use crate::dma::{DmaChannel, DmaTiming};
-use crate::ppu::{Ppu, EVENT_FRAME, EVENT_HBLANK, EVENT_VBLANK};
+use crate::ppu::{Ppu, EVENT_FRAME, EVENT_HBLANK, EVENT_HBLANK_ANY, EVENT_VBLANK};
 use crate::timer::Timers;
 
 pub const IRQ_VBLANK: u16 = 1 << 0;
@@ -32,7 +32,7 @@ pub struct Bus {
     pub master_enable: bool,
     pub waitcnt: u16,
     pub postflg: u8,
-    pub serial: [u16; 16],
+    pub serial: [u16; 32],
     pub use_hle_bios: bool,
 
     /// Cycles the current instruction spent waiting on memory.
@@ -42,9 +42,16 @@ pub struct Bus {
     bios_latch: u32,
     /// True while the program counter sits inside the BIOS.
     executing_bios: bool,
-    wait16: [u32; 16],
-    wait32: [u32; 16],
+    wait16_n: [u32; 16],
+    wait16_s: [u32; 16],
+    wait32_n: [u32; 16],
+    wait32_s: [u32; 16],
+    /// Address an access has to start at to count as sequential.
+    next_sequential: u32,
+    prefetch: bool,
     dma_active: bool,
+    /// Set by a write to HALTCNT; the processor picks it up on its next step.
+    pub halt_requested: bool,
 }
 
 impl Bus {
@@ -65,18 +72,25 @@ impl Bus {
             master_enable: false,
             waitcnt: 0,
             postflg: 0,
-            serial: [0; 16],
+            serial: [0; 32],
             use_hle_bios: true,
             access_cycles: 0,
             frame_ready: false,
             open_bus: 0,
             bios_latch: 0xe129_f000,
             executing_bios: false,
-            wait16: [1; 16],
-            wait32: [1; 16],
+            wait16_n: [1; 16],
+            wait16_s: [1; 16],
+            wait32_n: [1; 16],
+            wait32_s: [1; 16],
+            next_sequential: 0,
+            prefetch: false,
             dma_active: false,
+            halt_requested: false,
         };
         bus.update_waitstates();
+        // The link port powers up in general purpose mode.
+        bus.serial[(0x134 - 0x120) / 2] = 0x8000;
         bus
     }
 
@@ -93,24 +107,61 @@ impl Bus {
             if self.waitcnt & 0x0080 != 0 { 1 } else { 4 },
             if self.waitcnt & 0x0400 != 0 { 1 } else { 8 },
         ];
-        // Internal memory.
-        self.wait16 = [1; 16];
-        self.wait32 = [1; 16];
-        self.wait16[2] = 3;
-        self.wait32[2] = 6;
-        self.wait32[5] = 2;
-        self.wait32[6] = 2;
+        self.prefetch = self.waitcnt & 0x4000 != 0;
+
+        // Internal memory costs the same whether or not the access follows on
+        // from the last one.
+        self.wait16_n = [1; 16];
+        self.wait32_n = [1; 16];
+        self.wait16_n[2] = 3;
+        self.wait32_n[2] = 6;
+        self.wait32_n[5] = 2;
+        self.wait32_n[6] = 2;
+
+        // A 32 bit cartridge access is two halfword accesses, the second of
+        // which is always sequential.
         for region in 0..3 {
             for mirror in 0..2 {
                 let index = 8 + region * 2 + mirror;
-                self.wait16[index] = 1 + first[region];
-                self.wait32[index] = 2 + first[region] + second[region];
+                self.wait16_n[index] = 1 + first[region];
+                self.wait32_n[index] = 2 + first[region] + second[region];
             }
         }
-        self.wait16[0xe] = 1 + sram;
-        self.wait16[0xf] = 1 + sram;
-        self.wait32[0xe] = 1 + sram;
-        self.wait32[0xf] = 1 + sram;
+        self.wait16_n[0xe] = 1 + sram;
+        self.wait16_n[0xf] = 1 + sram;
+        self.wait32_n[0xe] = 1 + sram;
+        self.wait32_n[0xf] = 1 + sram;
+
+        self.wait16_s = self.wait16_n;
+        self.wait32_s = self.wait32_n;
+        for (region, cost) in second.iter().enumerate() {
+            for mirror in 0..2 {
+                let index = 8 + region * 2 + mirror;
+                self.wait16_s[index] = 1 + cost;
+                self.wait32_s[index] = 2 + cost * 2;
+            }
+        }
+    }
+
+    /// Charges an access and returns its cost. Cartridge reads are much cheaper
+    /// when they follow on from the previous one, and cheaper again when the
+    /// prefetch unit is enabled and the processor is running straight through
+    /// ROM, which is what `code` marks.
+    #[inline]
+    fn charge(&mut self, address: u32, wide: bool, code: bool) -> u32 {
+        let region = Self::region(address);
+        let width = if wide { 4 } else { 2 };
+        let sequential = address == self.next_sequential;
+        self.next_sequential = address.wrapping_add(width);
+        if code && sequential && self.prefetch && (0x8..=0xd).contains(&region) {
+            return width / 2;
+        }
+        match (wide, sequential) {
+            (false, false) => self.wait16_n[region],
+            (false, true) => self.wait16_s[region],
+            (true, false) => self.wait32_n[region],
+            (true, true) => self.wait32_s[region],
+        }
     }
 
     /// Writes an IO register without charging the access to the CPU.
@@ -159,6 +210,9 @@ impl Bus {
         if events & EVENT_HBLANK != 0 {
             self.trigger_dma(DmaTiming::HBlank);
         }
+        if events & EVENT_HBLANK_ANY != 0 {
+            self.run_video_capture();
+        }
         if events & EVENT_VBLANK != 0 {
             self.trigger_dma(DmaTiming::VBlank);
         }
@@ -200,22 +254,22 @@ impl Bus {
     }
 
     pub fn read8(&mut self, address: u32) -> u8 {
-        self.access_cycles += self.wait16[Self::region(address)];
+        self.access_cycles += self.charge(address, false, false);
         self.load8(address)
     }
 
     pub fn read16(&mut self, address: u32) -> u16 {
-        self.access_cycles += self.wait16[Self::region(address)];
+        self.access_cycles += self.charge(address, false, false);
         self.load16(address)
     }
 
     pub fn read32(&mut self, address: u32) -> u32 {
-        self.access_cycles += self.wait32[Self::region(address)];
+        self.access_cycles += self.charge(address, true, false);
         self.load32(address)
     }
 
     pub fn read16_code(&mut self, address: u32) -> u16 {
-        self.access_cycles += self.wait16[Self::region(address)];
+        self.access_cycles += self.charge(address, false, true);
         self.executing_bios = address < 0x4000;
         let value = self.load16(address);
         if self.executing_bios {
@@ -226,7 +280,7 @@ impl Bus {
     }
 
     pub fn read32_code(&mut self, address: u32) -> u32 {
-        self.access_cycles += self.wait32[Self::region(address)];
+        self.access_cycles += self.charge(address, true, true);
         self.executing_bios = address < 0x4000;
         let value = self.load32(address);
         if self.executing_bios {
@@ -242,17 +296,17 @@ impl Bus {
     }
 
     pub fn write8(&mut self, address: u32, value: u8) {
-        self.access_cycles += self.wait16[Self::region(address)];
+        self.access_cycles += self.charge(address, false, false);
         self.store8(address, value);
     }
 
     pub fn write16(&mut self, address: u32, value: u16) {
-        self.access_cycles += self.wait16[Self::region(address)];
+        self.access_cycles += self.charge(address, false, false);
         self.store16(address, value);
     }
 
     pub fn write32(&mut self, address: u32, value: u32) {
-        self.access_cycles += self.wait32[Self::region(address)];
+        self.access_cycles += self.charge(address, true, false);
         self.store32(address, value);
     }
 
@@ -506,7 +560,8 @@ impl Bus {
                 let index = (offset - 0x100) / 4;
                 self.timers.read(index, (offset / 2) & 1)
             }
-            0x120..=0x12e | 0x134..=0x15e => self.serial[((offset - 0x120) / 2) & 0xf],
+            0x120..=0x126 => 0xffff,
+            0x128..=0x12e | 0x134..=0x15e => self.serial[(offset - 0x120) / 2],
             0x130 => self.keyinput,
             0x132 => self.keycnt,
             0x200 => self.interrupt_enable,
@@ -527,8 +582,9 @@ impl Bus {
             }
             0x0a0..=0x0a7 => self.apu.push_fifo((offset - 0xa0) / 4, value as u32),
             0x301 => {
-                // HALTCNT: bit 7 clear halts, set stops.
+                // HALTCNT: either way the processor stops until an interrupt.
                 let _ = value;
+                self.halt_requested = true;
             }
             _ => {
                 let aligned = offset & !1;
@@ -602,7 +658,15 @@ impl Bus {
                 }
             }
             0x120..=0x12e | 0x134..=0x15e => {
-                self.serial[((offset - 0x120) / 2) & 0xf] = value;
+                self.serial[(offset - 0x120) / 2] = value;
+                if offset == 0x128 && value & 0x0080 != 0 {
+                    // No cable is attached, so the transfer finishes at once
+                    // rather than leaving the game spinning on the busy bit.
+                    self.serial[(0x128 - 0x120) / 2] &= !0x0080;
+                    if value & 0x4000 != 0 {
+                        self.raise_irq(1 << 7);
+                    }
+                }
             }
             0x132 => self.keycnt = value,
             0x200 => self.interrupt_enable = value & 0x3fff,
@@ -688,6 +752,22 @@ impl Bus {
         if self.cart.kind != kind {
             self.cart.kind = kind;
             self.cart.save = vec![0xff; kind.size()];
+        }
+    }
+
+    /// DMA3's special timing copies one block per scanline from line 2 to 161,
+    /// which games use to stream a bitmap into video memory.
+    fn run_video_capture(&mut self) {
+        if !self.dma[3].enabled() || self.dma[3].timing() != DmaTiming::Special {
+            return;
+        }
+        let line = self.ppu.hblank_line;
+        if line == 162 {
+            self.dma[3].control &= !0x8000;
+            return;
+        }
+        if (2..162).contains(&line) {
+            self.run_dma(3);
         }
     }
 
@@ -800,5 +880,66 @@ fn vram_offset(address: u32) -> usize {
         offset - 0x8000
     } else {
         offset
+    }
+}
+
+impl crate::state::Snapshot for Bus {
+    fn save(&self, writer: &mut crate::state::Writer) {
+        writer.bytes(&self.ewram);
+        writer.bytes(&self.iwram);
+        self.ppu.save(writer);
+        self.apu.save(writer);
+        self.cart.save(writer);
+        self.timers.save(writer);
+        for channel in &self.dma {
+            channel.save(writer);
+        }
+        writer.u16(self.keyinput);
+        writer.u16(self.keycnt);
+        writer.u16(self.interrupt_enable);
+        writer.u16(self.interrupt_flags);
+        writer.bool(self.master_enable);
+        writer.u16(self.waitcnt);
+        writer.u8(self.postflg);
+        for register in self.serial {
+            writer.u16(register);
+        }
+        writer.u32(self.open_bus);
+        writer.u32(self.bios_latch);
+        writer.bool(self.executing_bios);
+        writer.u32(self.next_sequential);
+        writer.bool(self.halt_requested);
+    }
+
+    fn load(&mut self, reader: &mut crate::state::Reader) -> Result<(), crate::state::StateError> {
+        reader.into_bytes(&mut self.ewram)?;
+        reader.into_bytes(&mut self.iwram)?;
+        self.ppu.load(reader)?;
+        self.apu.load(reader)?;
+        self.cart.load(reader)?;
+        self.timers.load(reader)?;
+        for channel in self.dma.iter_mut() {
+            channel.load(reader)?;
+        }
+        self.keyinput = reader.u16()?;
+        self.keycnt = reader.u16()?;
+        self.interrupt_enable = reader.u16()?;
+        self.interrupt_flags = reader.u16()?;
+        self.master_enable = reader.bool()?;
+        self.waitcnt = reader.u16()?;
+        self.postflg = reader.u8()?;
+        for register in self.serial.iter_mut() {
+            *register = reader.u16()?;
+        }
+        self.open_bus = reader.u32()?;
+        self.bios_latch = reader.u32()?;
+        self.executing_bios = reader.bool()?;
+        self.next_sequential = reader.u32()?;
+        self.halt_requested = reader.bool()?;
+        self.access_cycles = 0;
+        self.frame_ready = false;
+        self.dma_active = false;
+        self.update_waitstates();
+        Ok(())
     }
 }

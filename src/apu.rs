@@ -625,3 +625,178 @@ impl Apu {
         }
     }
 }
+
+use crate::state::{Reader, Snapshot, StateError, Writer};
+
+impl Snapshot for Envelope {
+    fn save(&self, writer: &mut Writer) {
+        writer.u8(self.initial);
+        writer.bool(self.increase);
+        writer.u8(self.period);
+        writer.u8(self.volume);
+        writer.u8(self.timer);
+    }
+    fn load(&mut self, reader: &mut Reader) -> Result<(), StateError> {
+        self.initial = reader.u8()?;
+        self.increase = reader.bool()?;
+        self.period = reader.u8()?;
+        self.volume = reader.u8()?;
+        self.timer = reader.u8()?;
+        Ok(())
+    }
+}
+
+impl Snapshot for Square {
+    fn save(&self, writer: &mut Writer) {
+        writer.bool(self.enabled);
+        writer.u16(self.frequency);
+        writer.i32(self.timer);
+        writer.usize(self.phase);
+        writer.usize(self.duty);
+        writer.u16(self.length);
+        writer.bool(self.length_enabled);
+        self.envelope.save(writer);
+        writer.u8(self.sweep_period);
+        writer.bool(self.sweep_decrease);
+        writer.u8(self.sweep_shift);
+        writer.u8(self.sweep_timer);
+        writer.bool(self.sweep_enabled);
+        writer.u16(self.sweep_shadow);
+    }
+    fn load(&mut self, reader: &mut Reader) -> Result<(), StateError> {
+        self.enabled = reader.bool()?;
+        self.frequency = reader.u16()?;
+        self.timer = reader.i32()?;
+        self.phase = reader.usize()? & 7;
+        self.duty = reader.usize()? & 3;
+        self.length = reader.u16()?;
+        self.length_enabled = reader.bool()?;
+        self.envelope.load(reader)?;
+        self.sweep_period = reader.u8()?;
+        self.sweep_decrease = reader.bool()?;
+        self.sweep_shift = reader.u8()?;
+        self.sweep_timer = reader.u8()?;
+        self.sweep_enabled = reader.bool()?;
+        self.sweep_shadow = reader.u16()?;
+        Ok(())
+    }
+}
+
+impl Snapshot for Wave {
+    fn save(&self, writer: &mut Writer) {
+        writer.bool(self.enabled);
+        writer.bool(self.playing);
+        for bank in &self.banks {
+            writer.bytes(bank);
+        }
+        writer.usize(self.bank);
+        writer.bool(self.two_banks);
+        writer.usize(self.position);
+        writer.u16(self.frequency);
+        writer.i32(self.timer);
+        writer.u8(self.volume);
+        writer.bool(self.force_75);
+        writer.u16(self.length);
+        writer.bool(self.length_enabled);
+    }
+    fn load(&mut self, reader: &mut Reader) -> Result<(), StateError> {
+        self.enabled = reader.bool()?;
+        self.playing = reader.bool()?;
+        for bank in self.banks.iter_mut() {
+            reader.into_bytes(bank)?;
+        }
+        self.bank = reader.usize()? & 1;
+        self.two_banks = reader.bool()?;
+        self.position = reader.usize()? & 31;
+        self.frequency = reader.u16()?;
+        self.timer = reader.i32()?;
+        self.volume = reader.u8()?;
+        self.force_75 = reader.bool()?;
+        self.length = reader.u16()?;
+        self.length_enabled = reader.bool()?;
+        Ok(())
+    }
+}
+
+impl Snapshot for Noise {
+    fn save(&self, writer: &mut Writer) {
+        writer.bool(self.enabled);
+        writer.u16(self.lfsr);
+        writer.i32(self.timer);
+        writer.u8(self.divisor);
+        writer.u8(self.shift);
+        writer.bool(self.width7);
+        writer.u16(self.length);
+        writer.bool(self.length_enabled);
+        self.envelope.save(writer);
+    }
+    fn load(&mut self, reader: &mut Reader) -> Result<(), StateError> {
+        self.enabled = reader.bool()?;
+        self.lfsr = reader.u16()?;
+        self.timer = reader.i32()?;
+        self.divisor = reader.u8()?;
+        self.shift = reader.u8()?;
+        self.width7 = reader.bool()?;
+        self.length = reader.u16()?;
+        self.length_enabled = reader.bool()?;
+        self.envelope.load(reader)
+    }
+}
+
+impl Snapshot for Fifo {
+    fn save(&self, writer: &mut Writer) {
+        let bytes: Vec<u8> = self.data.iter().map(|sample| *sample as u8).collect();
+        writer.bytes(&bytes);
+        writer.usize(self.read);
+        writer.usize(self.write);
+        writer.usize(self.length);
+        writer.u8(self.current as u8);
+    }
+    fn load(&mut self, reader: &mut Reader) -> Result<(), StateError> {
+        let mut bytes = [0u8; 32];
+        reader.into_bytes(&mut bytes)?;
+        for (slot, byte) in self.data.iter_mut().zip(bytes) {
+            *slot = byte as i8;
+        }
+        self.read = reader.usize()? & 31;
+        self.write = reader.usize()? & 31;
+        self.length = reader.usize()?.min(32);
+        self.current = reader.u8()? as i8;
+        Ok(())
+    }
+}
+
+impl Snapshot for Apu {
+    fn save(&self, writer: &mut Writer) {
+        self.square1.save(writer);
+        self.square2.save(writer);
+        self.wave.save(writer);
+        self.noise.save(writer);
+        self.fifo[0].save(writer);
+        self.fifo[1].save(writer);
+        writer.u16(self.control_l);
+        writer.u16(self.control_h);
+        writer.u16(self.control_x);
+        writer.u16(self.bias);
+        writer.u32(self.sample_timer);
+        writer.u32(self.sequencer_timer);
+        writer.u32(self.sequencer_step);
+    }
+    fn load(&mut self, reader: &mut Reader) -> Result<(), StateError> {
+        self.square1.load(reader)?;
+        self.square2.load(reader)?;
+        self.wave.load(reader)?;
+        self.noise.load(reader)?;
+        self.fifo[0].load(reader)?;
+        self.fifo[1].load(reader)?;
+        self.control_l = reader.u16()?;
+        self.control_h = reader.u16()?;
+        self.control_x = reader.u16()?;
+        self.bias = reader.u16()?;
+        self.sample_timer = reader.u32()?;
+        self.sequencer_timer = reader.u32()?;
+        self.sequencer_step = reader.u32()? & 7;
+        self.buffer.clear();
+        Ok(())
+    }
+}

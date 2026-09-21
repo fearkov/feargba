@@ -1,5 +1,5 @@
 use fear_gba::{png, Gba, HEIGHT, WIDTH};
-use minifb::{Key, Scale, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 use std::{
     env, fs,
     path::PathBuf,
@@ -216,19 +216,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio::Output::start().ok()
     };
 
+    let state_path = save_path.with_extension("state");
     let mut frames_shown = 0u32;
     let mut last_report = Instant::now();
     let mut save_due: Option<Instant> = None;
+    let mut notice: Option<(String, Instant)> = None;
+    let mut paused = false;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        gba.set_keys(read_keys(&window));
-        gba.run_frame();
-        window.update_with_buffer(gba.framebuffer(), WIDTH, HEIGHT)?;
-        let samples = gba.take_audio();
-        match audio.as_mut() {
-            Some(output) => output.push(&samples),
-            None => drop(samples),
+        if window.is_key_pressed(Key::P, KeyRepeat::No) {
+            paused = !paused;
+            notice = Some((
+                if paused { "paused" } else { "running" }.to_string(),
+                Instant::now(),
+            ));
         }
+        if window.is_key_pressed(Key::F1, KeyRepeat::No) {
+            let message = match fs::write(&state_path, gba.save_state()) {
+                Ok(()) => "state saved".to_string(),
+                Err(error) => format!("state not saved: {error}"),
+            };
+            notice = Some((message, Instant::now()));
+        }
+        if window.is_key_pressed(Key::F2, KeyRepeat::No) {
+            let message = match fs::read(&state_path) {
+                Ok(data) => match gba.load_state(&data) {
+                    Ok(()) => "state loaded".to_string(),
+                    Err(error) => format!("state not loaded: {error}"),
+                },
+                Err(error) => format!("state not loaded: {error}"),
+            };
+            notice = Some((message, Instant::now()));
+        }
+        if window.is_key_pressed(Key::F12, KeyRepeat::No) {
+            let path = next_screenshot_path(&options.rom);
+            let message = match fs::write(&path, png::encode(gba.framebuffer(), WIDTH, HEIGHT)) {
+                Ok(()) => format!("wrote {}", path.display()),
+                Err(error) => format!("screenshot failed: {error}"),
+            };
+            notice = Some((message, Instant::now()));
+        }
+
+        // Holding tab runs several frames per refresh and throws the audio away.
+        let speed = if window.is_key_down(Key::Tab) { 5 } else { 1 };
+        if !paused {
+            gba.set_keys(read_keys(&window));
+            for _ in 0..speed {
+                gba.run_frame();
+                let samples = gba.take_audio();
+                if speed == 1 {
+                    if let Some(output) = audio.as_mut() {
+                        output.push(&samples);
+                    }
+                }
+            }
+        }
+        window.update_with_buffer(gba.framebuffer(), WIDTH, HEIGHT)?;
 
         // Flush backup memory a moment after the game stops writing to it.
         if gba.bus.cart.save_dirty {
@@ -240,10 +283,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fs::write(&save_path, &gba.bus.cart.save)?;
         }
 
-        frames_shown += 1;
+        frames_shown += speed;
         if last_report.elapsed() >= Duration::from_secs(1) {
             let fps = frames_shown as f32 / last_report.elapsed().as_secs_f32();
-            window.set_title(&format!("{title} - {fps:.0} fps"));
+            match notice.as_ref().filter(|(_, at)| at.elapsed().as_secs() < 3) {
+                Some((message, _)) => window.set_title(&format!("{title} - {fps:.0} fps - {message}")),
+                None => window.set_title(&format!("{title} - {fps:.0} fps")),
+            }
             frames_shown = 0;
             last_report = Instant::now();
         }
@@ -253,6 +299,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(&save_path, &gba.bus.cart.save)?;
     }
     Ok(())
+}
+
+/// Picks the first free `name-NN.png` beside the cartridge.
+fn next_screenshot_path(rom: &std::path::Path) -> PathBuf {
+    let stem = rom
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "screenshot".to_string());
+    for index in 1..1000 {
+        let candidate = rom.with_file_name(format!("{stem}-{index:02}.png"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    rom.with_file_name(format!("{stem}.png"))
 }
 
 fn read_keys(window: &Window) -> u16 {
