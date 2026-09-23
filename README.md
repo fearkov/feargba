@@ -3,10 +3,13 @@
 Game Boy Advance emulator written in Rust. The way the subsystems are split up
 follows [gdkGBA](https://github.com/gdkchan/gdkGBA).
 
-Pokemon Emerald boots, plays and saves. No BIOS file is required; the SWI calls
+Most games boot, play and save. No BIOS file is required; the SWI calls
 are implemented in the emulator and the interrupt dispatcher is assembled into
 a small synthetic BIOS image. Pass a real BIOS with `--bios` and that is used
 instead.
+
+<img width="481" height="348" alt="image" src="https://github.com/user-attachments/assets/99550ec2-8b3c-4f9b-8277-a8e5f7d8af59" />
+
 
 ## Running
 
